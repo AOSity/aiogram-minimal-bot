@@ -92,19 +92,14 @@ def transcribe_audio(file_path: str) -> str:
 
 
 # ============================================================
-# Voice / Audio
+# Voice
 # ============================================================
 
-@router.message(F.voice | F.audio)
+@router.message(F.voice)
 async def process_audio(message: Message):
 
-    if message.voice:
-        file_id = message.voice.file_id
-        extension = ".ogg"
-
-    else:
-        file_id = message.audio.file_id
-        extension = ".mp3"
+    file_id = message.voice.file_id
+    extension = ".ogg"
 
     await transcribe_message(
         message,
@@ -115,10 +110,10 @@ async def process_audio(message: Message):
 
 
 # ============================================================
-# Video
+# Video circle
 # ============================================================
 
-@router.message(F.video | F.video_note)
+@router.message(F.video_note)
 async def process_video(message: Message):
 
     if message.video:
