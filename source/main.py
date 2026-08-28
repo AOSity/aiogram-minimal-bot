@@ -213,10 +213,7 @@ async def transcribe_message(
 
             text = "I couldn't recognize any speech."
 
-        await status_message.delete()
-
-        # Reply to the original message
-        await message.reply(
+        await status_message.edit_text(
             f"📝 {text}"
         )
 
