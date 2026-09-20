@@ -8,6 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
+from groq import Groq
 
 
 # ============================================================
@@ -17,9 +18,15 @@ from faster_whisper import WhisperModel
 load_dotenv()
 
 API_TOKEN = os.getenv("API_TOKEN")
+STT_TOKEN = os.getenv("STT_TOKEN")
 
 if not API_TOKEN:
     raise RuntimeError("API_TOKEN is not set")
+
+if not STT_TOKEN:
+    raise RuntimeError("STT_TOKEN is not set")
+
+GROQ_MODEL = "whisper-large-v3-turbo"
 
 
 # ============================================================
@@ -44,18 +51,27 @@ dp.include_router(router)
 
 
 # ============================================================
-# Whisper
+# Groq
 # ============================================================
 
-logging.info("Loading Whisper model...")
+groq_client = Groq(
+    api_key=STT_TOKEN
+)
 
-model = WhisperModel(
+
+# ============================================================
+# Local Whisper
+# ============================================================
+
+logging.info("Loading local Whisper model...")
+
+local_model = WhisperModel(
     "base",
     device="cpu",
     compute_type="int8"
 )
 
-logging.info("Whisper model loaded")
+logging.info("Local Whisper model loaded")
 
 
 # ============================================================
@@ -73,12 +89,34 @@ async def send_help(message: Message):
 
 
 # ============================================================
-# Speech-to-text
+# Groq transcription
 # ============================================================
 
-def transcribe_audio(file_path: str) -> str:
+def transcribe_with_groq(
+    file_path: str
+) -> str:
 
-    segments, info = model.transcribe(
+    with open(file_path, "rb") as audio_file:
+
+        transcription = groq_client.audio.transcriptions.create(
+            file=audio_file,
+            model=GROQ_MODEL,
+            response_format="json",
+            temperature=0
+        )
+
+    return transcription.text.strip()
+
+
+# ============================================================
+# Local Whisper transcription
+# ============================================================
+
+def transcribe_with_local_whisper(
+    file_path: str
+) -> str:
+
+    segments, info = local_model.transcribe(
         file_path,
         beam_size=5
     )
@@ -92,20 +130,108 @@ def transcribe_audio(file_path: str) -> str:
 
 
 # ============================================================
+# Speech-to-text with fallback
+# ============================================================
+
+async def transcribe_audio(
+    file_path: str
+) -> str:
+
+    try:
+
+        logging.info(
+            "Trying Groq transcription..."
+        )
+
+        text = await asyncio.to_thread(
+            transcribe_with_groq,
+            file_path
+        )
+
+        logging.info(
+            "Groq transcription successful"
+        )
+
+        return text
+
+    except Exception:
+
+        logging.exception(
+            "Groq transcription failed, "
+            "falling back to local Whisper"
+        )
+
+    logging.info(
+        "Using local Whisper fallback..."
+    )
+
+    text = await asyncio.to_thread(
+        transcribe_with_local_whisper,
+        file_path
+    )
+
+    logging.info(
+        "Local Whisper transcription successful"
+    )
+
+    return text
+
+
+# ============================================================
+# Extract audio from video
+# ============================================================
+
+async def extract_audio(
+    video_path: str,
+    audio_path: str
+):
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        audio_path,
+
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    _, stderr = await process.communicate()
+
+    if process.returncode != 0:
+
+        logging.error(
+            "FFmpeg error:\n%s",
+            stderr.decode(
+                errors="replace"
+            )
+        )
+
+        raise RuntimeError(
+            "FFmpeg failed to extract audio"
+        )
+
+
+# ============================================================
 # Voice
 # ============================================================
 
 @router.message(F.voice)
 async def process_audio(message: Message):
 
-    file_id = message.voice.file_id
-    extension = ".ogg"
-
     await transcribe_message(
         message,
-        file_id,
-        extension,
-        extract_audio=False
+        message.voice.file_id,
+        ".ogg",
+        is_video=False
     )
 
 
@@ -116,16 +242,11 @@ async def process_audio(message: Message):
 @router.message(F.video_note)
 async def process_video(message: Message):
 
-    if message.video:
-        file_id = message.video.file_id
-    else:
-        file_id = message.video_note.file_id
-
     await transcribe_message(
         message,
-        file_id,
+        message.video_note.file_id,
         ".mp4",
-        extract_audio=True
+        is_video=True
     )
 
 
@@ -137,7 +258,7 @@ async def transcribe_message(
     message: Message,
     file_id: str,
     extension: str,
-    extract_audio: bool
+    is_video: bool
 ):
 
     status_message = await message.reply(
@@ -153,59 +274,48 @@ async def transcribe_message(
                 f"input{extension}"
             )
 
-            # Get Telegram file information
+            # ------------------------------------------------
+            # Download Telegram file
+            # ------------------------------------------------
+
             telegram_file = await bot.get_file(
                 file_id
             )
 
-            # Download it
             await bot.download_file(
                 telegram_file.file_path,
                 destination=input_path
             )
 
-            audio_path = input_path
-
             # ------------------------------------------------
             # Extract audio from video
             # ------------------------------------------------
 
-            if extract_audio:
+            if is_video:
 
                 audio_path = os.path.join(
                     temp_dir,
                     "audio.wav"
                 )
 
-                process = await asyncio.create_subprocess_exec(
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    input_path,
-                    "-vn",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "16000",
-                    audio_path,
-
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
+                logging.info(
+                    "Extracting audio from video..."
                 )
 
-                await process.communicate()
+                await extract_audio(
+                    input_path,
+                    audio_path
+                )
 
-                if process.returncode != 0:
-                    raise RuntimeError(
-                        "FFmpeg failed to extract audio"
-                    )
+            else:
+
+                audio_path = input_path
 
             # ------------------------------------------------
-            # Whisper
+            # Speech-to-text
             # ------------------------------------------------
 
-            text = await asyncio.to_thread(
-                transcribe_audio,
+            text = await transcribe_audio(
                 audio_path
             )
 
@@ -234,7 +344,6 @@ async def transcribe_message(
 
 async def main():
 
-    # Remove pending updates from before startup
     await bot.delete_webhook(
         drop_pending_updates=True
     )
